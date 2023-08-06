@@ -130,7 +130,28 @@ pub struct Interaction {
     /// define the set of options just for kind=select
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
+
+    /// default value of interaction
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<DefaultValue>,
+
+    /// perform this interaction even if default is supplied, default is to skip
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_if_has_default: Option<bool>,
 }
+
+/// default value of interaction, depending on the type of interaction
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DefaultValue {
+    /// default value for text input
+    Input(String),
+    /// default value for select - index of the option
+    Select(usize),
+    /// default value for confirm - true or false
+    Confirm(bool),
+}
+
 impl Interaction {
     fn update_varbag(&self, input: &str, varbag: Option<&mut VarBag>) {
         varbag.map(|bag| {
@@ -151,27 +172,42 @@ impl Interaction {
         events: Option<&mut TestEvents<IntoIter<KeyEvent>>>,
     ) -> Result<Response> {
         let question = self.to_question();
-        let answer = if let Some(events) = events {
+        let mut prompt = requestty::PromptModule::new([question]);
+        let answer = self.to_default_answer();
+        if let Some(answer) = answer {
+            prompt = prompt.with_answers(requestty::Answers::from_iter(
+                [("question".to_string(), answer)].into_iter(),
+            ));
+        }
+
+        if let Some(events) = events {
             let mut backend = TestBackend::new(Size::from((50, 20)));
-            requestty::prompt_one_with(question, &mut backend, events)
+            prompt.prompt_with(&mut backend, events)
         } else {
-            requestty::prompt_one(question)
+            prompt.prompt()
         }?;
 
+        let answers = prompt.into_answers();
+        let answer = answers.get("question");
+
         Ok(match answer {
-            Answer::String(input) => {
+            Some(Answer::String(input)) => {
                 self.update_varbag(&input, varbag);
 
-                Response::Text(input)
+                Response::Text(input.to_string())
             }
-            Answer::ListItem(selected) => {
+            Some(Answer::ListItem(selected)) => {
                 self.update_varbag(&selected.text, varbag);
-                Response::Text(selected.text)
+                Response::Text(selected.text.clone())
             }
-            Answer::Bool(confirmed) if confirmed => {
+            Some(Answer::Bool(confirmed)) if *confirmed => {
                 let as_string = "true".to_string();
                 self.update_varbag(&as_string, varbag);
                 Response::Text(as_string)
+            }
+            None => {
+                Response::Cancel
+                // this is not supposed to happen
             }
             _ => {
                 Response::Cancel
@@ -180,19 +216,65 @@ impl Interaction {
         })
     }
 
+    fn to_default_answer(&self) -> Option<Answer> {
+        if let Some(default) = &self.default_value {
+            Some(match default {
+                DefaultValue::Input(ref input) => Answer::String(input.clone()),
+                DefaultValue::Select(index) => Answer::ListItem(requestty::ListItem {
+                    text: self.options.as_ref().unwrap()[*index].clone(),
+                    index: *index,
+                }),
+                DefaultValue::Confirm(confirmed) => Answer::Bool(*confirmed),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Convert the interaction into a question
     pub fn to_question(&self) -> Question<'_> {
         match self.kind {
-            InteractionKind::Input => Question::input("question")
-                .message(self.prompt.clone())
-                .build(),
-            InteractionKind::Select => Question::select("question")
-                .message(self.prompt.clone())
-                .choices(self.options.clone().unwrap_or_default())
-                .build(),
-            InteractionKind::Confirm => Question::confirm("question")
-                .message(self.prompt.clone())
-                .build(),
+            InteractionKind::Input => {
+                let builder = Question::input("question").message(self.prompt.clone());
+                if let Some(ask) = self.ask_if_has_default {
+                    if ask {
+                        builder.ask_if_answered(ask)
+                    } else {
+                        builder
+                    }
+                } else {
+                    builder
+                }
+                .build()
+            }
+            InteractionKind::Select => {
+                let builder = Question::select("question")
+                    .message(self.prompt.clone())
+                    .choices(self.options.clone().unwrap_or_default());
+                if let Some(ask) = self.ask_if_has_default {
+                    if ask {
+                        builder.ask_if_answered(ask)
+                    } else {
+                        builder
+                    }
+                } else {
+                    builder
+                }
+                .build()
+            }
+            InteractionKind::Confirm => {
+                let builder = Question::confirm("question").message(self.prompt.clone());
+                if let Some(ask) = self.ask_if_has_default {
+                    if ask {
+                        builder.ask_if_answered(ask)
+                    } else {
+                        builder
+                    }
+                } else {
+                    builder
+                }
+                .build()
+            }
         }
     }
 }
